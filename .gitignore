@@ -16,5 +16,6 @@ __pycache__/
 .cache
 .vs
 env/
+.venv
 
 muselsl/docs

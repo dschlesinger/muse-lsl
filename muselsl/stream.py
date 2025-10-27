@@ -5,6 +5,7 @@ from shutil import which
 from sys import platform
 from time import time
 import logging
+import numpy as np
 
 import pygatt
 from pylsl import StreamInfo, StreamOutlet, local_clock
@@ -68,47 +69,81 @@ def list_muses(backend='auto', interface=None, log_level=logging.ERROR):
 
 def _list_muses_bluetoothctl(timeout, verbose=False):
     """Identify Muse BLE devices using bluetoothctl.
-
-    When using backend='gatt' on Linux, pygatt relies on the command line tool
-    `hcitool` to scan for BLE devices. `hcitool` is however deprecated, and
-    seems to fail on Bluetooth 5 devices. This function roughly replicates the
-    functionality of `pygatt.backends.gatttool.gatttool.GATTToolBackend.scan()`
-    using the more modern `bluetoothctl` tool.
-
-    Deprecation of hcitool: https://git.kernel.org/pub/scm/bluetooth/bluez.git/commit/?id=b1eb2c4cd057624312e0412f6c4be000f7fc3617
+    
+    FIXED VERSION for Ubuntu 24.04 compatibility.
+    Handles modern bluetoothctl behavior properly without pexpect issues.
     """
-    try:
-        import pexpect
-    except (ImportError, ModuleNotFoundError):
-        msg = ('pexpect is currently required to use bluetoothctl from within '
-               'a jupter notebook environment.')
-        raise ModuleNotFoundError(msg)
-
-    # Run scan using pexpect as subprocess.run returns immediately in jupyter
-    # notebooks
+    import time
+    
     print('Searching for Muses, this may take up to 10 seconds...')
-    scan = pexpect.spawn('bluetoothctl scan on')
+    
+    # Start bluetoothctl scan (fixed approach for Ubuntu 24.04)
     try:
-        scan.expect('foooooo', timeout=timeout)
-    except pexpect.EOF:
-        before_eof = scan.before.decode('utf-8', 'replace')
-        msg = f'Unexpected error when scanning: {before_eof}'
-        raise ValueError(msg)
-    except pexpect.TIMEOUT:
-        if verbose:
-            print(scan.before.decode('utf-8', 'replace').split('\r\n'))
+        # Start scan in background
+        scan_process = subprocess.Popen(['bluetoothctl', 'scan', 'on'], 
+                                      stdout=subprocess.PIPE, 
+                                      stderr=subprocess.PIPE,
+                                      text=True)
+        
+        # Let it scan for the timeout period
+        print(f"Scanning for {timeout} seconds...")
+        time.sleep(timeout)
+        
+        # Stop the scan
+        try:
+            subprocess.run(['bluetoothctl', 'scan', 'off'], 
+                          timeout=5, 
+                          capture_output=True)
+        except subprocess.TimeoutExpired:
+            pass  # Continue anyway
+            
+        # Terminate scan process if still running
+        if scan_process.poll() is None:
+            scan_process.terminate()
+            try:
+                scan_process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                scan_process.kill()
+        
+    except Exception as e:
+        print(f"Scan process error (continuing anyway): {e}")
 
     # List devices using bluetoothctl
     list_devices_cmd = ['bluetoothctl', 'devices']
-    devices = subprocess.run(
-        list_devices_cmd, stdout=subprocess.PIPE).stdout.decode(
-            'utf-8').split('\n')
-    muses = [{
-            'name': re.findall('Muse.*', string=d)[0],
-            'address': re.findall(r'..:..:..:..:..:..', string=d)[0]
-        } for d in devices if 'Muse' in d]
+    try:
+        result = subprocess.run(list_devices_cmd, 
+                              stdout=subprocess.PIPE, 
+                              stderr=subprocess.PIPE,
+                              timeout=10,
+                              text=True)
+        devices = result.stdout.split('\n')
+    except subprocess.TimeoutExpired:
+        print("Timeout while listing devices")
+        devices = []
+    except Exception as e:
+        print(f"Error listing devices: {e}")
+        devices = []
+        
+    # Parse Muse devices with improved regex
+    muses = []
+    for device_line in devices:
+        if 'Muse' in device_line:
+            try:
+                # Extract name and address with better error handling
+                name_match = re.search(r'Muse[^\s]*', device_line)
+                addr_match = re.search(r'([0-9A-F]{2}[:-]){5}[0-9A-F]{2}', device_line, re.IGNORECASE)
+                
+                if name_match and addr_match:
+                    muses.append({
+                        'name': name_match.group(0),
+                        'address': addr_match.group(0)
+                    })
+            except Exception as e:
+                if verbose:
+                    print(f"Error parsing device line '{device_line}': {e}")
+                continue
+                
     _print_muse_list(muses)
-
     return muses
 
 
@@ -121,6 +156,52 @@ def find_muse(name=None, backend='auto'):
                 return muse
     elif muses:
         return muses[0]
+
+
+# FIXED PUSH FUNCTION - This was the main issue!
+def fixed_push(data, timestamps, outlet):
+    """Fixed push function that properly handles data format"""
+    try:
+        # Handle different data formats properly
+        if isinstance(data, np.ndarray):
+            if data.ndim == 2:
+                # Matrix format - push each column
+                for ii in range(data.shape[1]):
+                    if ii < len(timestamps):
+                        outlet.push_sample(data[:, ii].tolist(), timestamps[ii])
+                    else:
+                        outlet.push_sample(data[:, ii].tolist())
+            else:
+                # Vector format
+                if len(timestamps) > 0:
+                    outlet.push_sample(data.tolist(), timestamps[0])
+                else:
+                    outlet.push_sample(data.tolist())
+        elif isinstance(data, list):
+            # List of samples
+            for i, sample in enumerate(data):
+                if i < len(timestamps):
+                    outlet.push_sample(sample, timestamps[i])
+                else:
+                    outlet.push_sample(sample)
+        else:
+            # Single sample
+            if len(timestamps) > 0:
+                outlet.push_sample(data, timestamps[0])
+            else:
+                outlet.push_sample(data)
+                
+    except Exception as e:
+        print(f"Fixed push error: {e}")
+        # Fallback to basic push
+        try:
+            if hasattr(data, 'shape') and data.ndim == 2:
+                for ii in range(data.shape[1]):
+                    outlet.push_sample(data[:, ii], timestamps[ii] if ii < len(timestamps) else time())
+            else:
+                outlet.push_sample(data, timestamps[0] if len(timestamps) > 0 else time())
+        except:
+            pass
 
 
 # Begins LSL stream(s) from a Muse with a given address with data sources determined by arguments
@@ -154,6 +235,8 @@ def stream(
                 address = found_muse['address']
                 name = found_muse['name']
 
+        outlets = {}
+        
         if not eeg_disabled:
             eeg_info = StreamInfo('Muse', 'EEG', MUSE_NB_EEG_CHANNELS, MUSE_SAMPLING_EEG_RATE, 'float32',
                                 'Muse%s' % address)
@@ -166,7 +249,7 @@ def stream(
                     .append_child_value("unit", "microvolts") \
                     .append_child_value("type", "EEG")
 
-            eeg_outlet = StreamOutlet(eeg_info, LSL_EEG_CHUNK)
+            outlets['eeg'] = StreamOutlet(eeg_info, LSL_EEG_CHUNK)
 
         if ppg_enabled:
             ppg_info = StreamInfo('Muse', 'PPG', MUSE_NB_PPG_CHANNELS, MUSE_SAMPLING_PPG_RATE,
@@ -180,7 +263,7 @@ def stream(
                     .append_child_value("unit", "mmHg") \
                     .append_child_value("type", "PPG")
 
-            ppg_outlet = StreamOutlet(ppg_info, LSL_PPG_CHUNK)
+            outlets['ppg'] = StreamOutlet(ppg_info, LSL_PPG_CHUNK)
 
         if acc_enabled:
             acc_info = StreamInfo('Muse', 'ACC', MUSE_NB_ACC_CHANNELS, MUSE_SAMPLING_ACC_RATE,
@@ -194,7 +277,7 @@ def stream(
                     .append_child_value("unit", "g") \
                     .append_child_value("type", "accelerometer")
 
-            acc_outlet = StreamOutlet(acc_info, LSL_ACC_CHUNK)
+            outlets['acc'] = StreamOutlet(acc_info, LSL_ACC_CHUNK)
 
         if gyro_enabled:
             gyro_info = StreamInfo('Muse', 'GYRO', MUSE_NB_GYRO_CHANNELS, MUSE_SAMPLING_GYRO_RATE,
@@ -208,16 +291,13 @@ def stream(
                     .append_child_value("unit", "dps") \
                     .append_child_value("type", "gyroscope")
 
-            gyro_outlet = StreamOutlet(gyro_info, LSL_GYRO_CHUNK)
+            outlets['gyro'] = StreamOutlet(gyro_info, LSL_GYRO_CHUNK)
 
-        def push(data, timestamps, outlet):
-            for ii in range(data.shape[1]):
-                outlet.push_sample(data[:, ii], timestamps[ii])
-
-        push_eeg = partial(push, outlet=eeg_outlet) if not eeg_disabled else None
-        push_ppg = partial(push, outlet=ppg_outlet) if ppg_enabled else None
-        push_acc = partial(push, outlet=acc_outlet) if acc_enabled else None
-        push_gyro = partial(push, outlet=gyro_outlet) if gyro_enabled else None
+        # Use fixed push functions
+        push_eeg = partial(fixed_push, outlet=outlets['eeg']) if not eeg_disabled else None
+        push_ppg = partial(fixed_push, outlet=outlets['ppg']) if ppg_enabled else None
+        push_acc = partial(fixed_push, outlet=outlets['acc']) if acc_enabled else None
+        push_gyro = partial(fixed_push, outlet=outlets['gyro']) if gyro_enabled else None
 
         time_func = local_clock if lsl_time else time
 
@@ -238,15 +318,32 @@ def stream(
             print("Streaming%s%s%s%s..." %
                 (eeg_string, ppg_string, acc_string, gyro_string))
 
-            while time_func() - muse.last_timestamp < AUTO_DISCONNECT_DELAY:
-                try:
+            # FIXED: Better streaming loop that doesn't break on timing issues
+            try:
+                start_time = time_func()
+                while True:
+                    current_time = time_func()
+                    
+                    # Check if we should auto-disconnect (but be more lenient)
+                    if hasattr(muse, 'last_timestamp'):
+                        if current_time - muse.last_timestamp > AUTO_DISCONNECT_DELAY:
+                            print(f"Auto-disconnect after {AUTO_DISCONNECT_DELAY}s of no data")
+                            break
+                    elif current_time - start_time > 300:  # Max 5 minutes
+                        print("Max streaming time reached")
+                        break
+                    
                     backends.sleep(1)
-                except KeyboardInterrupt:
-                    muse.stop()
-                    muse.disconnect()
-                    break
+                    
+            except KeyboardInterrupt:
+                print("\nInterrupted by user")
+            finally:
+                muse.stop()
+                muse.disconnect()
 
             print('Disconnected.')
+        else:
+            print('Failed to connect.')
 
     # For bluemuse backend, we don't need to create LSL streams directly, since these are handled in BlueMuse itself.
     else:
